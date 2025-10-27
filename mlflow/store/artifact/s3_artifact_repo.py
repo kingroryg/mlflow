@@ -13,6 +13,7 @@ from mlflow.entities.multipart_upload import (
 )
 from mlflow.environment_variables import (
     MLFLOW_BOTO_CLIENT_ADDRESSING_STYLE,
+    MLFLOW_S3_BUCKET_OWNER,
     MLFLOW_S3_ENDPOINT_URL,
     MLFLOW_S3_IGNORE_TLS,
     MLFLOW_S3_UPLOAD_EXTRA_ARGS,
@@ -83,7 +84,8 @@ def _cached_get_s3_client(
     return boto3.client(
         "s3",
         config=Config(
-            signature_version=signature_version, s3={"addressing_style": addressing_style}
+            signature_version=signature_version,
+            s3={"addressing_style": addressing_style},
         ),
         endpoint_url=s3_endpoint_url,
         verify=verify,
@@ -113,7 +115,9 @@ def _get_s3_client(
 
     # NOTE: If you need to specify this env variable, please file an issue at
     # https://github.com/mlflow/mlflow/issues so we know your use-case!
-    signature_version = os.environ.get("MLFLOW_EXPERIMENTAL_S3_SIGNATURE_VERSION", "s3v4")
+    signature_version = os.environ.get(
+        "MLFLOW_EXPERIMENTAL_S3_SIGNATURE_VERSION", "s3v4"
+    )
 
     # Invalidate cache every `_MAX_CACHE_SECONDS`
     timestamp = int(_get_utcnow_timestamp() / _MAX_CACHE_SECONDS)
@@ -168,6 +172,7 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         session_token=None,
         tracking_uri: str | None = None,
         registry_uri: str | None = None,
+        expected_bucket_owner=None,
     ) -> None:
         """
         Initialize an S3 artifact repository.
@@ -183,11 +188,18 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
                 Used with STS tokens or IAM roles.
             tracking_uri: Optional URI for the MLflow tracking server.
                 If None, uses the current tracking URI context.
+            expected_bucket_owner: Optional AWS account ID of the expected bucket owner.
+                If provided, this will be included in all S3 API calls to verify bucket
+                ownership and prevent bucket impersonation attacks. Can also be set via
+                the MLFLOW_S3_BUCKET_OWNER environment variable.
         """
         super().__init__(artifact_uri, tracking_uri, registry_uri)
         self._access_key_id = access_key_id
         self._secret_access_key = secret_access_key
         self._session_token = session_token
+        self._expected_bucket_owner = (
+            expected_bucket_owner or MLFLOW_S3_BUCKET_OWNER.get()
+        )
 
     def _get_s3_client(self):
         return _get_s3_client(
@@ -234,6 +246,17 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         else:
             return None
 
+    def _get_bucket_owner_params(self):
+        """
+        Get bucket ownership parameters for S3 API calls.
+
+        Returns:
+            Dictionary containing ExpectedBucketOwner if configured, empty dict otherwise.
+        """
+        if self._expected_bucket_owner:
+            return {"ExpectedBucketOwner": self._expected_bucket_owner}
+        return {}
+
     def _upload_file(self, s3_client, local_file, bucket, key):
         extra_args = {}
         guessed_type, guessed_encoding = guess_type(local_file)
@@ -244,7 +267,11 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         environ_extra_args = self.get_s3_file_upload_extra_args()
         if environ_extra_args is not None:
             extra_args.update(environ_extra_args)
-        s3_client.upload_file(Filename=local_file, Bucket=bucket, Key=key, ExtraArgs=extra_args)
+        # Add bucket owner verification
+        extra_args.update(self._get_bucket_owner_params())
+        s3_client.upload_file(
+            Filename=local_file, Bucket=bucket, Key=key, ExtraArgs=extra_args
+        )
 
     def log_artifact(self, local_file, artifact_path=None):
         """
@@ -265,7 +292,10 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
             dest_path = posixpath.join(dest_path, artifact_path)
         dest_path = posixpath.join(dest_path, os.path.basename(local_file))
         self._upload_file(
-            s3_client=self._get_s3_client(), local_file=local_file, bucket=bucket, key=dest_path
+            s3_client=self._get_s3_client(),
+            local_file=local_file,
+            bucket=bucket,
+            key=dest_path,
         )
 
     def log_artifacts(self, local_dir, artifact_path=None):
@@ -327,7 +357,9 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         try:
             s3_client = self._get_s3_client()
             paginator = s3_client.get_paginator("list_objects_v2")
-            results = paginator.paginate(Bucket=bucket, Prefix=prefix, Delimiter="/")
+            paginate_params = {"Bucket": bucket, "Prefix": prefix, "Delimiter": "/"}
+            paginate_params.update(self._get_bucket_owner_params())
+            results = paginator.paginate(**paginate_params)
             for result in results:
                 yield result
         except ClientError as error:
@@ -374,7 +406,9 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
                 self._verify_listed_object_contains_artifact_path_prefix(
                     listed_object_path=subdir_path, artifact_path=artifact_path
                 )
-                subdir_rel_path = posixpath.relpath(path=subdir_path, start=artifact_path)
+                subdir_rel_path = posixpath.relpath(
+                    path=subdir_path, start=artifact_path
+                )
                 subdir_rel_path = subdir_rel_path.removesuffix("/")
                 infos.append(FileInfo(subdir_rel_path, True, None))
             # Objects listed directly will be files
@@ -389,7 +423,9 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         return sorted(infos, key=lambda f: f.path)
 
     @staticmethod
-    def _verify_listed_object_contains_artifact_path_prefix(listed_object_path, artifact_path):
+    def _verify_listed_object_contains_artifact_path_prefix(
+        listed_object_path, artifact_path
+    ):
         if not listed_object_path.startswith(artifact_path):
             raise MlflowException(
                 "The path of the listed S3 object does not begin with the specified"
@@ -413,7 +449,8 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         (bucket, s3_root_path) = self.parse_s3_compliant_uri(self.artifact_uri)
         s3_full_path = posixpath.join(s3_root_path, remote_file_path)
         s3_client = self._get_s3_client()
-        s3_client.download_file(bucket, s3_full_path, local_path)
+        extra_args = self._get_bucket_owner_params()
+        s3_client.download_file(bucket, s3_full_path, local_path, ExtraArgs=extra_args)
 
     def delete_artifacts(self, artifact_path=None):
         (bucket, dest_path) = self.parse_s3_compliant_uri(self.artifact_uri)
@@ -423,7 +460,9 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         dest_path = dest_path.rstrip("/") if dest_path else ""
         s3_client = self._get_s3_client()
         paginator = s3_client.get_paginator("list_objects_v2")
-        results = paginator.paginate(Bucket=bucket, Prefix=dest_path)
+        paginate_params = {"Bucket": bucket, "Prefix": dest_path}
+        paginate_params.update(self._get_bucket_owner_params())
+        results = paginator.paginate(**paginate_params)
         for result in results:
             keys = []
             for to_delete_obj in result.get("Contents", []):
@@ -433,7 +472,9 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
                 )
                 keys.append({"Key": file_path})
             if keys:
-                s3_client.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+                delete_params = {"Bucket": bucket, "Delete": {"Objects": keys}}
+                delete_params.update(self._get_bucket_owner_params())
+                s3_client.delete_objects(**delete_params)
 
     def create_multipart_upload(self, local_file, num_parts=1, artifact_path=None):
         """
@@ -463,22 +504,20 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
             dest_path = posixpath.join(dest_path, artifact_path)
         dest_path = posixpath.join(dest_path, os.path.basename(local_file))
         s3_client = self._get_s3_client()
-        create_response = s3_client.create_multipart_upload(
-            Bucket=bucket,
-            Key=dest_path,
-        )
+        create_params = {"Bucket": bucket, "Key": dest_path}
+        create_params.update(self._get_bucket_owner_params())
+        create_response = s3_client.create_multipart_upload(**create_params)
         upload_id = create_response["UploadId"]
         credentials = []
         for i in range(1, num_parts + 1):  # part number must be in [1, 10000]
-            url = s3_client.generate_presigned_url(
-                "upload_part",
-                Params={
-                    "Bucket": bucket,
-                    "Key": dest_path,
-                    "PartNumber": i,
-                    "UploadId": upload_id,
-                },
-            )
+            presign_params = {
+                "Bucket": bucket,
+                "Key": dest_path,
+                "PartNumber": i,
+                "UploadId": upload_id,
+            }
+            presign_params.update(self._get_bucket_owner_params())
+            url = s3_client.generate_presigned_url("upload_part", Params=presign_params)
             credentials.append(
                 MultipartUploadCredential(
                     url=url,
@@ -491,7 +530,9 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
             upload_id=upload_id,
         )
 
-    def complete_multipart_upload(self, local_file, upload_id, parts=None, artifact_path=None):
+    def complete_multipart_upload(
+        self, local_file, upload_id, parts=None, artifact_path=None
+    ):
         """
         Complete a multipart upload by combining all parts into a single S3 object.
 
@@ -515,9 +556,14 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
         dest_path = posixpath.join(dest_path, os.path.basename(local_file))
         parts = [{"PartNumber": part.part_number, "ETag": part.etag} for part in parts]
         s3_client = self._get_s3_client()
-        s3_client.complete_multipart_upload(
-            Bucket=bucket, Key=dest_path, UploadId=upload_id, MultipartUpload={"Parts": parts}
-        )
+        complete_params = {
+            "Bucket": bucket,
+            "Key": dest_path,
+            "UploadId": upload_id,
+            "MultipartUpload": {"Parts": parts},
+        }
+        complete_params.update(self._get_bucket_owner_params())
+        s3_client.complete_multipart_upload(**complete_params)
 
     def abort_multipart_upload(self, local_file, upload_id, artifact_path=None):
         """
@@ -539,8 +585,6 @@ class S3ArtifactRepository(ArtifactRepository, MultipartUploadMixin):
             dest_path = posixpath.join(dest_path, artifact_path)
         dest_path = posixpath.join(dest_path, os.path.basename(local_file))
         s3_client = self._get_s3_client()
-        s3_client.abort_multipart_upload(
-            Bucket=bucket,
-            Key=dest_path,
-            UploadId=upload_id,
-        )
+        abort_params = {"Bucket": bucket, "Key": dest_path, "UploadId": upload_id}
+        abort_params.update(self._get_bucket_owner_params())
+        s3_client.abort_multipart_upload(**abort_params)
